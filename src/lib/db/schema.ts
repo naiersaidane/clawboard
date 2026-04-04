@@ -10,6 +10,7 @@ export const templates = sqliteTable('templates', {
   deliveryChannel: text('delivery_channel').notNull().default('discord'),
   deliveryRecipient: text('delivery_recipient'),
   model: text('model').notNull().default('openrouter/anthropic/claude-sonnet-4'),
+  sessionTarget: text('session_target').default('current'),
   skipPreInstructions: integer('skip_pre_instructions').notNull().default(0),
   cronJobId: text('cron_job_id'),
   executionCount: integer('execution_count').notNull().default(0),

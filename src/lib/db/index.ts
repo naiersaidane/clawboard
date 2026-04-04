@@ -42,6 +42,9 @@ function initDb() {
   // Migration: add skip_pre_instructions column (safe for existing DBs)
   try { sqlite.exec(`ALTER TABLE templates ADD COLUMN skip_pre_instructions INTEGER NOT NULL DEFAULT 0`) } catch { /* column already exists */ }
 
+  // Migration: add session_target column (safe for existing DBs)
+  try { sqlite.exec(`ALTER TABLE templates ADD COLUMN session_target TEXT DEFAULT 'current'`) } catch { /* column already exists */ }
+
   return drizzle(sqlite, { schema })
 }
 

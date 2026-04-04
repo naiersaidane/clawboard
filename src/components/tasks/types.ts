@@ -10,6 +10,7 @@ export interface Template {
   deliveryChannel: string;
   deliveryRecipient: string | null;
   model: string;
+  sessionTarget: string;
   skipPreInstructions: boolean;
   cronJobId: string | null;
   executionCount: number;

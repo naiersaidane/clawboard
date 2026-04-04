@@ -41,7 +41,7 @@ export interface RawJob {
   createdAtMs: number
   updatedAtMs: number
   schedule: RawJobSchedule
-  sessionTarget?: string
+  sessionTarget?: 'isolated' | 'current' | 'main'
   wakeMode?: string
   payload: RawJobPayload
   state: RawJobState

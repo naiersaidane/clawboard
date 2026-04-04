@@ -35,6 +35,7 @@ function syncJobWithTemplate(tpl: typeof import('@/lib/db/schema').templates.$in
     job.delivery.channel = tpl.deliveryChannel
     job.delivery.to = tpl.deliveryRecipient ? `channel:${tpl.deliveryRecipient}` : undefined
   }
+  job.sessionTarget = (tpl.sessionTarget as RawJob['sessionTarget']) || 'current'
   job.updatedAtMs = Date.now()
   writeJobs(jobs)
 }
@@ -53,6 +54,7 @@ export async function createTemplate(
     deliveryChannel: data.deliveryChannel,
     deliveryRecipient: data.deliveryRecipient,
     model: data.model,
+    sessionTarget: data.sessionTarget || 'current',
     skipPreInstructions: data.skipPreInstructions ? 1 : 0,
     cronJobId: data.cronJobId,
     executionCount: 0,
@@ -200,7 +202,7 @@ export async function createSchedule(data: {
       expr: data.cronExpression,
       tz: data.timezone,
     },
-    sessionTarget: 'isolated',
+    sessionTarget: (tpl.sessionTarget as RawJob['sessionTarget']) || 'current',
     wakeMode: 'now',
     payload: {
       kind: 'agentTurn',
