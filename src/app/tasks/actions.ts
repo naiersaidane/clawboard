@@ -6,11 +6,10 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { templates, preInstructions } from '@/lib/db/schema'
 import { eq } from 'drizzle-orm'
-import { CronExpressionParser } from 'cron-parser'
-import { readJobs, writeJobs, appendRun } from '@/lib/cron/reader'
+import { appendRun } from '@/lib/cron/reader'
+import { runOpenclaw } from '@/lib/cron/cli'
 import { getOpenclawSpawn } from '@/lib/config'
 import type { Template } from '@/components/tasks/types'
-import type { RawJob } from '@/lib/cron/types'
 
 function buildMessage(tpl: { preInstructions: string | null; skillName: string | null; instructions: string; skipPreInstructions?: number | boolean }, globalPre?: string | null): string {
   return [
@@ -21,23 +20,38 @@ function buildMessage(tpl: { preInstructions: string | null; skillName: string |
   ].filter(Boolean).join('\n\n---\n\n')
 }
 
+/**
+ * Arguments CLI de livraison (--announce + canal + destinataire).
+ * Reproduit le delivery historique : { mode: 'announce', channel, to: 'channel:<id>', bestEffort: true }.
+ */
+function deliveryArgs(channel?: string | null, recipient?: string | null): string[] {
+  if (!channel || !recipient) return []
+  const dest = recipient.includes(':') ? recipient : `channel:${recipient}`
+  return ['--announce', '--best-effort-deliver', '--channel', channel, '--to', dest]
+}
+
+/**
+ * Argument CLI de session. Le CLI n'accepte que main|isolated ;
+ * la valeur historique 'current' (défaut Clawboard) laisse le défaut du Gateway.
+ */
+function sessionArgs(sessionTarget?: string | null): string[] {
+  if (sessionTarget === 'isolated' || sessionTarget === 'main') return ['--session', sessionTarget]
+  return []
+}
+
+/** Synchronise le job cron lié (nom, message, modèle, livraison, session) via `openclaw cron edit`. */
 function syncJobWithTemplate(tpl: typeof import('@/lib/db/schema').templates.$inferSelect): void {
   if (!tpl.cronJobId) return
-  const jobs = readJobs()
-  const job = jobs.find((j) => j.id === tpl.cronJobId)
-  if (!job) return
-
   const pre = db.select().from(preInstructions).where(eq(preInstructions.id, 1)).get()
-  job.payload.message = buildMessage(tpl, pre?.content)
-  job.name = tpl.name
-  if (tpl.model) job.payload.model = tpl.model
-  if (tpl.deliveryChannel && job.delivery) {
-    job.delivery.channel = tpl.deliveryChannel
-    job.delivery.to = tpl.deliveryRecipient ? `channel:${tpl.deliveryRecipient}` : undefined
-  }
-  job.sessionTarget = (tpl.sessionTarget as RawJob['sessionTarget']) || 'current'
-  job.updatedAtMs = Date.now()
-  writeJobs(jobs)
+  const message = buildMessage(tpl, pre?.content)
+
+  const args = ['cron', 'edit', tpl.cronJobId, '--name', tpl.name, '--message', message]
+  if (tpl.model) args.push('--model', tpl.model)
+  args.push(...sessionArgs(tpl.sessionTarget))
+  args.push(...deliveryArgs(tpl.deliveryChannel, tpl.deliveryRecipient))
+
+  const res = runOpenclaw(args)
+  if (!res.ok) console.error('[clawboard] cron edit (sync template) a échoué :', res.stderr)
 }
 
 export async function createTemplate(
@@ -72,7 +86,7 @@ export async function updateTemplate(id: string, updates: Partial<Template>) {
     .where(eq(templates.id, id))
     .run()
 
-  // Sync changes to jobs.json if template is linked to a cron job
+  // Propage les changements au job cron lié (le cas échéant)
   const tpl = db.select().from(templates).where(eq(templates.id, id)).get()
   if (tpl) syncJobWithTemplate(tpl)
 
@@ -165,12 +179,8 @@ export async function runNow(templateId: string) {
 }
 
 export async function toggleSchedule(cronJobId: string, enabled: boolean) {
-  const jobs = readJobs()
-  const job = jobs.find((j) => j.id === cronJobId)
-  if (!job) return
-  job.enabled = enabled
-  job.updatedAtMs = Date.now()
-  writeJobs(jobs)
+  const res = runOpenclaw(['cron', enabled ? 'enable' : 'disable', cronJobId])
+  if (!res.ok) console.error('[clawboard] cron enable/disable a échoué :', res.stderr)
   revalidatePath('/tasks')
 }
 
@@ -179,60 +189,41 @@ export async function createSchedule(data: {
   cronExpression: string
   timezone: string
 }) {
-  const jobs = readJobs()
   const tpl = db.select().from(templates).where(eq(templates.id, data.templateId)).get()
   if (!tpl) return
 
-  const jobId = `clawboard-${crypto.randomUUID().slice(0, 8)}`
-  const now = Date.now()
-
-  // Build the full message from pre-instructions + template
   const pre = db.select().from(preInstructions).where(eq(preInstructions.id, 1)).get()
-  const messageParts = buildMessage(tpl, pre?.content)
+  const message = buildMessage(tpl, pre?.content)
 
-  const newJob: RawJob = {
-    id: jobId,
-    agentId: tpl.agentId || 'main',
-    name: tpl.name,
-    enabled: true,
-    createdAtMs: now,
-    updatedAtMs: now,
-    schedule: {
-      kind: 'cron',
-      expr: data.cronExpression,
-      tz: data.timezone,
-    },
-    sessionTarget: (tpl.sessionTarget as RawJob['sessionTarget']) || 'current',
-    wakeMode: 'now',
-    payload: {
-      kind: 'agentTurn',
-      message: messageParts,
-      model: tpl.model || undefined,
-    },
-    state: {
-      nextRunAtMs: (() => {
-        try {
-          const interval = CronExpressionParser.parse(data.cronExpression, { tz: data.timezone })
-          return interval.next().getTime()
-        } catch { return 0 }
-      })(),
-      lastRunAtMs: 0,
-      lastStatus: '',
-      lastDurationMs: 0,
-      consecutiveErrors: 0,
-    },
-    delivery: tpl.deliveryChannel ? {
-      mode: 'announce',
-      bestEffort: true,
-      channel: tpl.deliveryChannel,
-      to: tpl.deliveryRecipient ? `channel:${tpl.deliveryRecipient}` : undefined,
-    } : undefined,
+  const args = [
+    'cron', 'add',
+    '--name', tpl.name,
+    '--agent', tpl.agentId || 'main',
+    '--cron', data.cronExpression,
+    '--tz', data.timezone,
+    '--message', message,
+    '--wake', 'now',
+    '--json',
+  ]
+  if (tpl.model) args.push('--model', tpl.model)
+  args.push(...sessionArgs(tpl.sessionTarget))
+  args.push(...deliveryArgs(tpl.deliveryChannel, tpl.deliveryRecipient))
+
+  const res = runOpenclaw(args)
+  if (!res.ok) {
+    console.error('[clawboard] cron add a échoué :', res.stderr)
+    return
   }
 
-  jobs.push(newJob)
-  writeJobs(jobs)
+  let jobId: string | undefined
+  try {
+    jobId = (JSON.parse(res.stdout) as { id?: string }).id
+  } catch {
+    console.error('[clawboard] cron add : réponse JSON illisible :', res.stdout.slice(0, 200))
+  }
+  if (!jobId) return
 
-  // Link template to cron job
+  // Lie le template au job cron créé
   db.update(templates)
     .set({ cronJobId: jobId, updatedAt: new Date().toISOString() })
     .where(eq(templates.id, data.templateId))
@@ -245,33 +236,28 @@ export async function updateSchedule(
   cronJobId: string,
   updates: { cronExpression?: string; timezone?: string; enabled?: boolean }
 ) {
-  const jobs = readJobs()
-  const job = jobs.find((j) => j.id === cronJobId)
-  if (!job) return
+  const args = ['cron', 'edit', cronJobId]
+  if (updates.cronExpression !== undefined) args.push('--cron', updates.cronExpression)
+  if (updates.timezone !== undefined) args.push('--tz', updates.timezone)
+  if (updates.enabled === true) args.push('--enable')
+  else if (updates.enabled === false) args.push('--disable')
 
-  if (updates.cronExpression !== undefined) job.schedule.expr = updates.cronExpression
-  if (updates.timezone !== undefined) job.schedule.tz = updates.timezone
-  if (updates.enabled !== undefined) job.enabled = updates.enabled
-  job.updatedAtMs = Date.now()
-
-  // Recalculate next run time when expression or timezone changes
-  if (updates.cronExpression !== undefined || updates.timezone !== undefined) {
-    try {
-      const interval = CronExpressionParser.parse(job.schedule.expr, { tz: job.schedule.tz })
-      job.state.nextRunAtMs = interval.next().getTime()
-    } catch { /* keep existing nextRunAtMs */ }
+  // Rien à modifier
+  if (args.length <= 3) {
+    revalidatePath('/tasks')
+    return
   }
 
-  writeJobs(jobs)
+  const res = runOpenclaw(args)
+  if (!res.ok) console.error('[clawboard] cron edit (schedule) a échoué :', res.stderr)
   revalidatePath('/tasks')
 }
 
 export async function deleteSchedule(cronJobId: string) {
-  const jobs = readJobs()
-  const filtered = jobs.filter((j) => j.id !== cronJobId)
-  writeJobs(filtered)
+  const res = runOpenclaw(['cron', 'rm', cronJobId])
+  if (!res.ok) console.error('[clawboard] cron rm a échoué :', res.stderr)
 
-  // Clear cronJobId from template
+  // Détache le template
   const tpl = db.select().from(templates).where(eq(templates.cronJobId, cronJobId)).get()
   if (tpl) {
     db.update(templates)
@@ -290,7 +276,7 @@ export async function savePreInstructions(content: string) {
     .where(eq(preInstructions.id, 1))
     .run()
 
-  // Sync all linked jobs with updated pre-instructions
+  // Resynchronise tous les jobs liés avec les nouvelles pre-instructions
   const allTemplates = db.select().from(templates).all()
   for (const tpl of allTemplates) {
     syncJobWithTemplate(tpl)

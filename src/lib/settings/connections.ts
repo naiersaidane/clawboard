@@ -1,6 +1,7 @@
 import fs from 'fs'
 import path from 'path'
 import type { ConnectionStatus } from '@/components/settings/types'
+import { readJobs } from '@/lib/cron/reader'
 
 function getCronPath(): string {
   return process.env.OPENCLAW_CRON_PATH || ''
@@ -59,11 +60,18 @@ export function checkConnections(): ConnectionStatus[] {
     checkedAt: now(),
   })
 
-  // Check cron/jobs.json
-  const jobsPath = cronPath ? path.join(cronPath, 'jobs.json') : ''
-  if (jobsPath && fs.existsSync(jobsPath)) {
-    const jobsData = readJsonFile(jobsPath) as { jobs?: unknown[] } | null
-    const jobCount = jobsData?.jobs?.length ?? 0
+  // Check cron store (SQLite depuis OpenClaw 2026.6.8 ; ancien jobs.json en repli)
+  const sqlitePath = openclawRoot ? path.join(openclawRoot, 'state', 'openclaw.sqlite') : ''
+  const legacyJobsPath = cronPath ? path.join(cronPath, 'jobs.json') : ''
+  const hasStore =
+    (sqlitePath && fs.existsSync(sqlitePath)) || (legacyJobsPath && fs.existsSync(legacyJobsPath))
+  if (hasStore) {
+    let jobCount = 0
+    try {
+      jobCount = readJobs().length
+    } catch {
+      // Gateway indisponible : on reste "connected" (le store existe) sans le compte
+    }
     statuses.push({
       id: 'cron-jobs',
       name: 'Cron Jobs',
@@ -76,7 +84,7 @@ export function checkConnections(): ConnectionStatus[] {
       id: 'cron-jobs',
       name: 'Cron Jobs',
       status: 'error',
-      detail: cronPath ? 'jobs.json not found' : 'OPENCLAW_CRON_PATH not set',
+      detail: cronPath ? 'cron store not found' : 'OPENCLAW_CRON_PATH not set',
       checkedAt: now(),
     })
   }

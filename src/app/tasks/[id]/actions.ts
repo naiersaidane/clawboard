@@ -5,7 +5,8 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { templates, preInstructions } from '@/lib/db/schema'
 import { eq } from 'drizzle-orm'
-import { readJobs, writeJobs, appendRun } from '@/lib/cron/reader'
+import { readJobs, appendRun } from '@/lib/cron/reader'
+import { runOpenclaw } from '@/lib/cron/cli'
 import { getOpenclawSpawn } from '@/lib/config'
 import type { TaskEditPayload } from '@/components/task-detail/types'
 
@@ -107,14 +108,9 @@ export async function runAgainTask(cronJobId: string) {
 }
 
 export async function editTask(cronJobId: string, updates: TaskEditPayload) {
-  const jobs = readJobs()
-  const job = jobs.find((j) => j.id === cronJobId)
-  if (!job) return
-
-  // Update job name in jobs.json
-  job.name = updates.name
-  job.updatedAtMs = Date.now()
-  writeJobs(jobs)
+  // Met à jour le nom du job côté Gateway
+  const res = runOpenclaw(['cron', 'edit', cronJobId, '--name', updates.name])
+  if (!res.ok) console.error('[clawboard] cron edit (rename) a échoué :', res.stderr)
 
   // Update template instructions in SQLite if linked
   const tpl = db.select().from(templates).where(eq(templates.cronJobId, cronJobId)).get()
@@ -134,22 +130,16 @@ export async function editTask(cronJobId: string, updates: TaskEditPayload) {
 }
 
 export async function archiveTask(cronJobId: string) {
-  const jobs = readJobs()
-  const job = jobs.find((j) => j.id === cronJobId)
-  if (!job) return
-
-  job.enabled = false
-  job.updatedAtMs = Date.now()
-  writeJobs(jobs)
+  const res = runOpenclaw(['cron', 'disable', cronJobId])
+  if (!res.ok) console.error('[clawboard] cron disable (archive) a échoué :', res.stderr)
 
   revalidatePath('/tasks')
   revalidatePath(`/tasks/${cronJobId}`)
 }
 
 export async function deleteTask(cronJobId: string) {
-  const jobs = readJobs()
-  const filtered = jobs.filter((j) => j.id !== cronJobId)
-  writeJobs(filtered)
+  const res = runOpenclaw(['cron', 'rm', cronJobId])
+  if (!res.ok) console.error('[clawboard] cron rm (delete) a échoué :', res.stderr)
 
   // Unlink template
   const tpl = db.select().from(templates).where(eq(templates.cronJobId, cronJobId)).get()
